@@ -1285,7 +1285,7 @@ async def main():
     await init_db()
     asyncio.create_task(check_unsubscribes())
     print("✅ Бот запущен")
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, handle_signals=False)
 
 
 if __name__ == "__main__":
