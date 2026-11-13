@@ -13,14 +13,13 @@ from aiogram.fsm.storage.memory import MemoryStorage
 # ================== НАСТРОЙКИ ==================
 BOT_TOKEN = "9023924024:AAHsVjuygA6foum-kHATKp8TKmGp2Xf2lXI"
 
-# ⚠️ Убран channel_binding (asyncpg его не поддерживает)
 DATABASE_URL = "postgresql://neondb_owner:npg_hRwYWpb5C0ry@ep-fancy-shadow-bescuz4s-pooler.c-9.us-east-2.aws.neon.tech/neondb?sslmode=require"
 
 CHANNEL_URL = "https://t.me/WxSubNews"
-CHANNEL_ID = -1003725062404   # числовой ID канала
+CHANNEL_ID = -1003725062404
 CURRENCY = "WxSub"
 HOLD_DAYS = 3
-BOT_USERNAME = "WxSubBot"     # ⚠️ БЕЗ @
+BOT_USERNAME = "WxSubBot"
 REFUND_FEE = 0.05
 PRIVACY_URL = "https://telegra.ph/WxSub-11-12"
 
@@ -120,6 +119,9 @@ async def init_db():
         ALTER TABLE users ADD COLUMN IF NOT EXISTS ref_earned DOUBLE PRECISION DEFAULT 0;
         ALTER TABLE users ADD COLUMN IF NOT EXISTS banned BOOLEAN DEFAULT FALSE;
         ALTER TABLE users ADD COLUMN IF NOT EXISTS banned_at TIMESTAMP;
+
+        CREATE UNIQUE INDEX IF NOT EXISTS channels_chat_id_unique ON channels (chat_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS tasks_user_channel_unique ON tasks (user_id, channel_id);
         """)
 
 
@@ -391,7 +393,7 @@ async def earn_cb(callback: CallbackQuery):
               AND (c.limit_total = 0 OR c.done_count < c.limit_total)
               AND NOT EXISTS (
                   SELECT 1 FROM tasks t
-                  WHERE t.user_id = $1 AND t.channel_id = c.id AND t.status = 'active'
+                  WHERE t.user_id = $1 AND t.channel_id = c.id
               )
             ORDER BY c.price DESC LIMIT 20
         """, user_id)
@@ -427,11 +429,15 @@ async def check_task_cb(callback: CallbackQuery):
         ch = await conn.fetchrow("SELECT * FROM channels WHERE id = $1", ch_id)
         if not ch:
             await callback.answer("Канал не найден", show_alert=True); return
+
         existing = await conn.fetchrow(
-            "SELECT * FROM tasks WHERE user_id=$1 AND channel_id=$2 AND status='active'",
+            "SELECT * FROM tasks WHERE user_id=$1 AND channel_id=$2",
             user_id, ch_id)
         if existing:
-            await callback.answer("Ты уже выполняешь это задание", show_alert=True); return
+            await callback.answer("❌ Ты уже выполнял это задание раньше", show_alert=True); return
+
+        if ch["limit_total"] > 0 and ch["done_count"] >= ch["limit_total"]:
+            await callback.answer("❌ Задание уже выполнено другими", show_alert=True); return
 
     try:
         m = await bot.get_chat_member(chat_id=ch["chat_id"], user_id=user_id)
@@ -443,18 +449,22 @@ async def check_task_cb(callback: CallbackQuery):
         await callback.answer("❌ Ты ещё не подписался на канал!", show_alert=True); return
 
     until = datetime.now() + timedelta(days=HOLD_DAYS)
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """INSERT INTO tasks (user_id, channel_id, price, status, done_at, check_until)
-               VALUES ($1,$2,$3,'active',$4,$5)""",
-            user_id, ch_id, ch["price"], datetime.now(), until)
-        await conn.execute("UPDATE channels SET done_count = done_count + 1 WHERE id = $1", ch_id)
-        await conn.execute(
-            "UPDATE users SET balance = balance + $1, tasks_done = tasks_done + 1 WHERE user_id = $2",
-            ch["price"], user_id)
-        await conn.execute(
-            "UPDATE promotions SET done_count = done_count + 1 WHERE channel_id = $1 AND status='active'",
-            ch["chat_id"])
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO tasks (user_id, channel_id, price, status, done_at, check_until)
+                   VALUES ($1,$2,$3,'active',$4,$5)""",
+                user_id, ch_id, ch["price"], datetime.now(), until)
+            await conn.execute("UPDATE channels SET done_count = done_count + 1 WHERE id = $1", ch_id)
+            await conn.execute(
+                "UPDATE users SET balance = balance + $1, tasks_done = tasks_done + 1 WHERE user_id = $2",
+                ch["price"], user_id)
+            await conn.execute(
+                "UPDATE promotions SET done_count = done_count + 1 WHERE channel_id = $1 AND status='active'",
+                ch["chat_id"])
+    except asyncpg.exceptions.UniqueViolationError:
+        await callback.answer("❌ Ты уже выполнял это задание раньше", show_alert=True)
+        return
 
     await callback.message.answer(
         f"✅ <b>Задание выполнено!</b>\n\n"
@@ -493,7 +503,6 @@ async def promo_pick(callback: CallbackQuery):
         reply_markup=cancel_kb(), parse_mode="HTML")
 
 
-# ⚠️ Сузили фильтр: ловит ТОЛЬКО @username и ссылки t.me
 @dp.message(
     F.text.startswith("@") |
     F.text.startswith("https://t.me/") |
@@ -524,7 +533,11 @@ async def on_channel_link(message: Message, state: FSMContext):
     async with pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO channels (owner_id, chat_id, title, link, price, limit_total, active)
-            VALUES ($1,$2,$3,$4,0,0,FALSE) ON CONFLICT DO NOTHING
+            VALUES ($1,$2,$3,$4,0,0,FALSE)
+            ON CONFLICT (chat_id) DO UPDATE
+            SET owner_id = EXCLUDED.owner_id,
+                title = EXCLUDED.title,
+                link = EXCLUDED.link
         """, message.from_user.id, chat.id, chat.title, f"https://t.me/{username}")
 
     await state.update_data(promo_chat_id=chat.id, promo_title=chat.title)
@@ -614,9 +627,10 @@ async def promo_confirm(callback: CallbackQuery, state: FSMContext):
         """, user_id, data["promo_chat_id"], data["promo_title"],
              data["price"], data["count"], data["total"])
         await conn.execute("""
-            UPDATE channels SET price = $1, limit_total = $2, active = TRUE
-            WHERE chat_id = $3 AND owner_id = $4
-        """, data["price"], data["count"], data["promo_chat_id"], user_id)
+            UPDATE channels
+            SET price = $1, limit_total = $2, done_count = 0, active = TRUE
+            WHERE chat_id = $3
+        """, data["price"], data["count"], data["promo_chat_id"])
 
     await state.clear()
     await callback.message.edit_text(
