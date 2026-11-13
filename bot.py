@@ -494,6 +494,10 @@ async def promo_pick(callback: CallbackQuery):
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def on_channel_link(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is not None:
+        return  # FSM-сценарий активен — не вмешиваемся
+
     waiting = dp.get("waiting_channel")
     if waiting != message.from_user.id:
         return
