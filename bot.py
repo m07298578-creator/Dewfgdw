@@ -12,13 +12,15 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 # ================== НАСТРОЙКИ ==================
 BOT_TOKEN = "9023924024:AAHsVjuygA6foum-kHATKp8TKmGp2Xf2lXI"
-DATABASE_URL = "postgresql://neondb_owner:npg_hRwYWpb5C0ry@ep-fancy-shadow-bescuz4s-pooler.c-9.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+
+# ⚠️ Убран channel_binding (asyncpg его не поддерживает)
+DATABASE_URL = "postgresql://neondb_owner:npg_hRwYWpb5C0ry@ep-fancy-shadow-bescuz4s-pooler.c-9.us-east-2.aws.neon.tech/neondb?sslmode=require"
 
 CHANNEL_URL = "https://t.me/WxSubNews"
-CHANNEL_ID = "-1003725062404"
+CHANNEL_ID = -1003725062404   # числовой ID канала
 CURRENCY = "WxSub"
 HOLD_DAYS = 3
-BOT_USERNAME = "@WxSubBot"
+BOT_USERNAME = "WxSubBot"     # ⚠️ БЕЗ @
 REFUND_FEE = 0.05
 PRIVACY_URL = "https://telegra.ph/WxSub-11-12"
 
@@ -327,7 +329,6 @@ async def check_sub_cb(callback: CallbackQuery):
             await conn.execute("UPDATE users SET subscribed = TRUE WHERE user_id = $1", uid)
         await try_reward_referrer(uid)
 
-        # 🔹 Приветствие после подписки + рекомендация про privacy
         await callback.message.edit_text(
             "✅ <b>Подписка подтверждена!</b>\n\n"
             "Спасибо за подписку и использование бота <b>WxSub</b>! 🎉\n\n"
@@ -492,12 +493,13 @@ async def promo_pick(callback: CallbackQuery):
         reply_markup=cancel_kb(), parse_mode="HTML")
 
 
-@dp.message(F.text & ~F.text.startswith("/"))
+# ⚠️ Сузили фильтр: ловит ТОЛЬКО @username и ссылки t.me
+@dp.message(
+    F.text.startswith("@") |
+    F.text.startswith("https://t.me/") |
+    F.text.startswith("t.me/")
+)
 async def on_channel_link(message: Message, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state is not None:
-        return  # FSM-сценарий активен — не вмешиваемся
-
     waiting = dp.get("waiting_channel")
     if waiting != message.from_user.id:
         return
