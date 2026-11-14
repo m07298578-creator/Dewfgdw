@@ -4,8 +4,8 @@ import aiohttp
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
-    Message, ReplyKeyboardMarkup, KeyboardButton,
-    ReplyKeyboardRemove
+    Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 )
 from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.fsm.context import FSMContext
@@ -42,7 +42,7 @@ REF_REWARD = 10000
 
 # ================== ЛИМИТЫ ==================
 MIN_PRICE = 100
-MAX_PRICE = 5000
+MAX_PRICE = 1000
 
 # ================== АДМИНЫ ==================
 ADMIN_IDS = [8786951363]
@@ -93,6 +93,18 @@ async def piarflow_check_sponsors(user_id: int, links: list[str]) -> list[dict]:
     except Exception as e:
         print(f"⚠️ PiarFlow /sponsors/check error: {e}")
         return []
+
+
+def piarflow_kb(sponsors: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for i, s in enumerate(sponsors, 1):
+        price_text = f" · {s.get('price', 0)}₽" if s.get('price') else ""
+        rows.append([InlineKeyboardButton(
+            text=f"📢 Спонсор {i}{price_text}",
+            url=s["link"]
+        )])
+    rows.append([InlineKeyboardButton(text="✅ Проверить", callback_data="piarflow_check")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ================== БАЗА ==================
@@ -283,13 +295,6 @@ def promote_kb():
     )
 
 
-def back_kb():
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="🔙 Назад")]],
-        resize_keyboard=True
-    )
-
-
 def cancel_kb():
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="❌ Отмена")]],
@@ -351,7 +356,6 @@ async def start_handler(message: Message, state: FSMContext, command: CommandObj
         await message.answer("🚫 Ты забанен в боте. Обратись к администратору.")
         return
 
-    # Рефералка
     if not existed and command.args and command.args.startswith("ref_"):
         try:
             referrer_id = int(command.args.replace("ref_", ""))
@@ -375,19 +379,18 @@ async def start_handler(message: Message, state: FSMContext, command: CommandObj
         )
         return
 
-    # 2. PiarFlow
+    # 2. PiarFlow-спонсоры
     sponsors = await piarflow_get_sponsors(user_id, message.chat.id)
     if sponsors:
         await state.set_state(PiarFlow.waiting_check)
         await state.update_data(piarflow_links=[s["link"] for s in sponsors])
-        text = "📢 <b>Обязательные задания</b>\n\nПодпишись на спонсоров, затем нажми «✅ Проверить»:\n\n"
-        for i, s in enumerate(sponsors, 1):
-            price_text = f" · {s.get('price', 0)}₽" if s.get('price') else ""
-            text += f"{i}. {s['link']}{price_text}\n"
-        await message.answer(text, reply_markup=ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="✅ Проверить PiarFlow")]],
-            resize_keyboard=True
-        ), parse_mode="HTML", disable_web_page_preview=True)
+        await message.answer(
+            "📢 <b>Обязательные задания</b>\n\n"
+            "Подпишись на спонсоров и нажми <b>«✅ Проверить»</b> — "
+            "иначе бот не откроется.",
+            reply_markup=piarflow_kb(sponsors),
+            parse_mode="HTML"
+        )
         return
 
     # 3. Меню
@@ -409,19 +412,17 @@ async def check_sub_handler(message: Message, state: FSMContext):
         await conn.execute("UPDATE users SET subscribed = TRUE WHERE user_id = $1", uid)
     await try_reward_referrer(uid)
 
-    # PiarFlow
     sponsors = await piarflow_get_sponsors(uid, message.chat.id)
     if sponsors:
         await state.set_state(PiarFlow.waiting_check)
         await state.update_data(piarflow_links=[s["link"] for s in sponsors])
-        text = "📢 <b>Обязательные задания</b>\n\nПодпишись на спонсоров, затем нажми «✅ Проверить»:\n\n"
-        for i, s in enumerate(sponsors, 1):
-            price_text = f" · {s.get('price', 0)}₽" if s.get('price') else ""
-            text += f"{i}. {s['link']}{price_text}\n"
-        await message.answer(text, reply_markup=ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="✅ Проверить PiarFlow")]],
-            resize_keyboard=True
-        ), parse_mode="HTML", disable_web_page_preview=True)
+        await message.answer(
+            "📢 <b>Обязательные задания</b>\n\n"
+            "Подпишись на спонсоров и нажми <b>«✅ Проверить»</b> — "
+            "иначе бот не откроется.",
+            reply_markup=piarflow_kb(sponsors),
+            parse_mode="HTML"
+        )
         return
 
     await message.answer(
@@ -443,15 +444,15 @@ async def sub_link_handler(message: Message):
     )
 
 
-# ================== ✅ Проверка PiarFlow ==================
-@dp.message(F.text == "✅ Проверить PiarFlow")
-async def piarflow_check_handler(message: Message, state: FSMContext):
-    user_id = message.from_user.id
+# ================== ✅ Проверка PiarFlow (inline callback) ==================
+@dp.callback_query(F.data == "piarflow_check")
+async def piarflow_check_cb(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
     data = await state.get_data()
     links = data.get("piarflow_links") or []
 
     if not links:
-        await message.answer("Сессия истекла. Напиши /start", reply_markup=main_menu_kb(user_id))
+        await callback.answer("Сессия истекла. Напиши /start", show_alert=True)
         return
 
     sponsors = await piarflow_check_sponsors(user_id, links)
@@ -459,19 +460,24 @@ async def piarflow_check_handler(message: Message, state: FSMContext):
 
     if not not_subscribed:
         await state.clear()
-        await message.answer(
-            "✅ <b>Все задания выполнены!</b>\n\nДобро пожаловать в главное меню.",
-            reply_markup=main_menu_kb(user_id), parse_mode="HTML"
+        await callback.message.edit_text(
+            "✅ <b>Все задания выполнены!</b>\n\n"
+            "Добро пожаловать в главное меню.",
+            reply_markup=None, parse_mode="HTML"
+        )
+        await callback.message.answer(
+            "🏠 Главное меню:",
+            reply_markup=main_menu_kb(user_id)
         )
     else:
         await state.update_data(piarflow_links=[s["link"] for s in not_subscribed])
-        text = "❌ <b>Не все задания выполнены</b>\n\nОсталось подписаться:\n\n"
-        for i, s in enumerate(not_subscribed, 1):
-            text += f"{i}. {s['link']}\n"
-        await message.answer(text, reply_markup=ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="✅ Проверить PiarFlow")]],
-            resize_keyboard=True
-        ), parse_mode="HTML", disable_web_page_preview=True)
+        await callback.message.edit_text(
+            "❌ <b>Не все задания выполнены</b>\n\n"
+            "Подпишись на оставшихся спонсоров и снова нажми «✅ Проверить».",
+            reply_markup=piarflow_kb(not_subscribed),
+            parse_mode="HTML"
+        )
+    await callback.answer()
 
 
 # ================== 🔙 Назад ==================
@@ -508,6 +514,16 @@ async def earn_handler(message: Message):
 
     sponsors = await piarflow_get_sponsors(user_id, message.chat.id)
 
+    if sponsors:
+        text = (
+            "💰 <b>Заработать</b>\n\n"
+            "🔥 <b>Доступные задания:</b>\n"
+            "Подпишись на спонсоров и нажми «✅ Проверить».\n\n"
+            "💎 После проверки получишь WxSub."
+        )
+        await message.answer(text, reply_markup=piarflow_kb(sponsors), parse_mode="HTML")
+        return
+
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT c.* FROM channels c
@@ -517,50 +533,45 @@ async def earn_handler(message: Message):
             ORDER BY c.price DESC LIMIT 20
         """, user_id)
 
-    if not rows and not sponsors:
+    if not rows:
         await message.answer("💰 <b>Заработать</b>\n\nПока нет доступных заданий. Заходи позже!",
                              reply_markup=earn_kb(), parse_mode="HTML")
         return
 
-    text = "💰 <b>Доступные задания</b>\n\n"
+    text = "💰 <b>Доступные задания</b>\n\n💎 <b>Задания WxSub:</b>\n"
+    kb_rows = []
+    for r in rows:
+        left = "∞" if r["limit_total"] == 0 else str(r["limit_total"] - r["done_count"])
+        text += f"• <b>{r['title']}</b> — {r['price']} {CURRENCY} (осталось: {left})\n"
+        kb_rows.append([
+            InlineKeyboardButton(text=f"{r['title']} | {r['price']} {CURRENCY}", url=r["link"]),
+            InlineKeyboardButton(text="✅ Проверить", callback_data=f"check_task_{r['id']}")
+        ])
 
-    if sponsors:
-        text += "🔥 <b>Спонсоры PiarFlow:</b>\n"
-        for i, s in enumerate(sponsors, 1):
-            price_text = f" · {s.get('price', 0)}₽" if s.get('price') else ""
-            text += f"{i}. {s['link']}{price_text}\n"
-        text += "\n👉 Подпишись и нажми «✅ Проверить PiarFlow»\n\n"
-
-    if rows:
-        text += "💎 <b>Задания WxSub:</b>\n"
-        for r in rows:
-            left = "∞" if r["limit_total"] == 0 else str(r["limit_total"] - r["done_count"])
-            text += f"• <b>{r['title']}</b> — {r['price']} {CURRENCY} (осталось: {left})\n"
-            text += f"  🔗 {r['link']}\n"
-            text += f"  👉 Подпишись → напиши «Проверить {r['title']}»\n\n"
-
-    await message.answer(text, reply_markup=earn_kb(), parse_mode="HTML", disable_web_page_preview=True)
+    text += "\n👉 Нажми на кнопку, чтобы подписаться, затем «✅ Проверить»."
+    await message.answer(text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
+        parse_mode="HTML", disable_web_page_preview=True)
 
 
-@dp.message(F.text.startswith("Проверить "))
-async def check_task_by_name(message: Message):
-    title = message.text.replace("Проверить ", "").strip()
-    user_id = message.from_user.id
+@dp.callback_query(F.data.startswith("check_task_"))
+async def check_task_cb(callback: CallbackQuery):
+    ch_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
 
     async with pool.acquire() as conn:
-        ch = await conn.fetchrow("SELECT * FROM channels WHERE title = $1 AND active = TRUE", title)
+        ch = await conn.fetchrow("SELECT * FROM channels WHERE id = $1", ch_id)
         if not ch:
-            await message.answer("❌ Канал не найден", reply_markup=earn_kb())
-            return
+            await callback.answer("Канал не найден", show_alert=True); return
 
-        existing = await conn.fetchrow("SELECT * FROM tasks WHERE user_id=$1 AND channel_id=$2", user_id, ch["id"])
+        existing = await conn.fetchrow(
+            "SELECT * FROM tasks WHERE user_id=$1 AND channel_id=$2",
+            user_id, ch_id)
         if existing:
-            await message.answer("❌ Ты уже выполнял это задание раньше", reply_markup=earn_kb())
-            return
+            await callback.answer("❌ Ты уже выполнял это задание раньше", show_alert=True); return
 
         if ch["limit_total"] > 0 and ch["done_count"] >= ch["limit_total"]:
-            await message.answer("❌ Задание уже выполнено другими", reply_markup=earn_kb())
-            return
+            await callback.answer("❌ Задание уже выполнено другими", show_alert=True); return
 
     try:
         m = await bot.get_chat_member(chat_id=ch["chat_id"], user_id=user_id)
@@ -569,8 +580,7 @@ async def check_task_by_name(message: Message):
         ok = False
 
     if not ok:
-        await message.answer("❌ Ты ещё не подписался на канал!", reply_markup=earn_kb())
-        return
+        await callback.answer("❌ Ты ещё не подписался на канал!", show_alert=True); return
 
     until = datetime.now() + timedelta(days=HOLD_DAYS)
     try:
@@ -578,8 +588,8 @@ async def check_task_by_name(message: Message):
             await conn.execute(
                 """INSERT INTO tasks (user_id, channel_id, price, status, done_at, check_until)
                    VALUES ($1,$2,$3,'active',$4,$5)""",
-                user_id, ch["id"], ch["price"], datetime.now(), until)
-            await conn.execute("UPDATE channels SET done_count = done_count + 1 WHERE id = $1", ch["id"])
+                user_id, ch_id, ch["price"], datetime.now(), until)
+            await conn.execute("UPDATE channels SET done_count = done_count + 1 WHERE id = $1", ch_id)
             await conn.execute(
                 "UPDATE users SET balance = balance + $1, tasks_done = tasks_done + 1 WHERE user_id = $2",
                 ch["price"], user_id)
@@ -587,15 +597,14 @@ async def check_task_by_name(message: Message):
                 "UPDATE promotions SET done_count = done_count + 1 WHERE channel_id = $1 AND status='active'",
                 ch["chat_id"])
     except asyncpg.exceptions.UniqueViolationError:
-        await message.answer("❌ Ты уже выполнял это задание раньше", reply_markup=earn_kb())
+        await callback.answer("❌ Ты уже выполнял это задание раньше", show_alert=True)
         return
 
-    await message.answer(
+    await callback.message.answer(
         f"✅ <b>Задание выполнено!</b>\n\n"
         f"Вам начислено <b>{ch['price']} {CURRENCY}</b>.\n\n"
         f"⚠️ Не отписывайтесь от канала в течение <b>{HOLD_DAYS} дней</b>.",
-        reply_markup=earn_kb(), parse_mode="HTML"
-    )
+        parse_mode="HTML")
 
 
 # ================== 📈 Продвижение ==================
