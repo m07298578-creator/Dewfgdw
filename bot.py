@@ -29,6 +29,7 @@ PRIVACY_URL = "https://telegra.ph/WxSub-11-12"
 PIARFLOW_API_KEY = "-C1I-pABEtPXlOkp_HnMSSczwbme2e-j"
 PIARFLOW_API_URL = "https://piarflow.com/v1"
 PIARFLOW_MAX_SPONSORS = 5
+PIARFLOW_REWARD = 3000  # 🔥 награда за подписку на спонсора
 # ================================================
 
 # ================== БОНУС ==================
@@ -95,15 +96,27 @@ async def piarflow_check_sponsors(user_id: int, links: list[str]) -> list[dict]:
         return []
 
 
+# ================== КЛАВИАТУРЫ ==================
 def piarflow_kb(sponsors: list[dict]) -> InlineKeyboardMarkup:
     rows = []
     for i, s in enumerate(sponsors, 1):
-        price_text = f" · {s.get('price', 0)}₽" if s.get('price') else ""
         rows.append([InlineKeyboardButton(
-            text=f"📢 Спонсор {i}{price_text}",
+            text=f"📢 Спонсор {i}",
             url=s["link"]
         )])
     rows.append([InlineKeyboardButton(text="✅ Проверить", callback_data="piarflow_check")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def earn_sponsors_kb(sponsors: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for i, s in enumerate(sponsors, 1):
+        rows.append([InlineKeyboardButton(
+            text=f"📢 Спонсор {i} · +{PIARFLOW_REWARD} {CURRENCY}",
+            url=s["link"]
+        )])
+    rows.append([InlineKeyboardButton(text="✅ Проверить", callback_data="earn_piarflow_check")])
+    rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -162,6 +175,14 @@ async def init_db():
             reward DOUBLE PRECISION NOT NULL,
             created_at TIMESTAMP DEFAULT NOW()
         );
+        CREATE TABLE IF NOT EXISTS piarflow_rewards (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            link TEXT NOT NULL,
+            amount DOUBLE PRECISION NOT NULL,
+            rewarded_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(user_id, link)
+        );
         ALTER TABLE promotions ADD COLUMN IF NOT EXISTS done_count INTEGER DEFAULT 0;
         ALTER TABLE promotions ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE;
         ALTER TABLE users ADD COLUMN IF NOT EXISTS bonus_streak INTEGER DEFAULT 0;
@@ -205,6 +226,24 @@ async def create_user(user_id: int, username: str):
         )
 
 
+async def give_piarflow_reward(user_id: int, link: str) -> bool:
+    """Начисляет 3000 WxSub за выполнение PiarFlow-задания (один раз)."""
+    async with pool.acquire() as conn:
+        try:
+            await conn.execute(
+                """INSERT INTO piarflow_rewards (user_id, link, amount)
+                   VALUES ($1, $2, $3)""",
+                user_id, link, PIARFLOW_REWARD
+            )
+        except asyncpg.exceptions.UniqueViolationError:
+            return False  # уже награждали
+        await conn.execute(
+            "UPDATE users SET balance = balance + $1, tasks_done = tasks_done + 1 WHERE user_id = $2",
+            PIARFLOW_REWARD, user_id
+        )
+    return True
+
+
 # ================== ПОДПИСКА ==================
 async def check_subscription(user_id: int) -> bool:
     try:
@@ -244,16 +283,6 @@ async def try_reward_referrer(referred_id: int):
 
 
 # ================== REPLY-КЛАВИАТУРЫ ==================
-def subscribe_kb():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📢 Подписаться на канал")],
-            [KeyboardButton(text="✅ Проверить подписку")]
-        ],
-        resize_keyboard=True
-    )
-
-
 def main_menu_kb(user_id: int):
     rows = [
         [KeyboardButton(text="💰 Заработать"), KeyboardButton(text="📈 Продвижение")],
@@ -368,18 +397,20 @@ async def start_handler(message: Message, state: FSMContext, command: CommandObj
                     await conn.execute("UPDATE users SET referred_by = $1 WHERE user_id = $2", referrer_id, user_id)
     await try_reward_referrer(user_id)
 
-    # 1. Проверка канала
+    # 1. Проверка нашего канала
     if not await check_subscription(user_id):
         await message.answer(
             "🔒 <b>Для использования бота подпишись на наш канал.</b>\n\n"
-            "1️⃣ Нажми «📢 Подписаться на канал»\n"
-            "2️⃣ Подпишись\n"
-            "3️⃣ Нажми «✅ Проверить подписку»",
-            reply_markup=subscribe_kb(), parse_mode="HTML"
+            "Нажми на кнопку ниже, подпишись и нажми <b>«✅ Проверить»</b>.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📢 Наш канал", url=CHANNEL_URL)],
+                [InlineKeyboardButton(text="✅ Проверить", callback_data="check_all_sub")]
+            ]),
+            parse_mode="HTML"
         )
         return
 
-    # 2. PiarFlow-спонсоры
+    # 2. PiarFlow-спонсоры (обязательные)
     sponsors = await piarflow_get_sponsors(user_id, message.chat.id)
     if sponsors:
         await state.set_state(PiarFlow.waiting_check)
@@ -387,7 +418,8 @@ async def start_handler(message: Message, state: FSMContext, command: CommandObj
         await message.answer(
             "📢 <b>Обязательные задания</b>\n\n"
             "Подпишись на спонсоров и нажми <b>«✅ Проверить»</b> — "
-            "иначе бот не откроется.",
+            "иначе бот не откроется.\n\n"
+            f"🎁 За каждого спонсора +<b>{PIARFLOW_REWARD} {CURRENCY}</b>",
             reply_markup=piarflow_kb(sponsors),
             parse_mode="HTML"
         )
@@ -400,51 +432,47 @@ async def start_handler(message: Message, state: FSMContext, command: CommandObj
     )
 
 
-# ================== ✅ Проверка канала ==================
-@dp.message(F.text == "✅ Проверить подписку")
-async def check_sub_handler(message: Message, state: FSMContext):
-    uid = message.from_user.id
+# ================== ✅ Проверка нашего канала ==================
+@dp.callback_query(F.data == "check_all_sub")
+async def check_all_sub_cb(callback: CallbackQuery, state: FSMContext):
+    uid = callback.from_user.id
+
     if not await check_subscription(uid):
-        await message.answer("❌ Ты ещё не подписался на канал!", reply_markup=subscribe_kb())
+        await callback.answer("❌ Ты ещё не подписался на наш канал!", show_alert=True)
         return
 
     async with pool.acquire() as conn:
         await conn.execute("UPDATE users SET subscribed = TRUE WHERE user_id = $1", uid)
     await try_reward_referrer(uid)
 
-    sponsors = await piarflow_get_sponsors(uid, message.chat.id)
+    sponsors = await piarflow_get_sponsors(uid, callback.message.chat.id)
     if sponsors:
         await state.set_state(PiarFlow.waiting_check)
         await state.update_data(piarflow_links=[s["link"] for s in sponsors])
-        await message.answer(
+        await callback.message.edit_text(
             "📢 <b>Обязательные задания</b>\n\n"
             "Подпишись на спонсоров и нажми <b>«✅ Проверить»</b> — "
-            "иначе бот не откроется.",
+            "иначе бот не откроется.\n\n"
+            f"🎁 За каждого спонсора +<b>{PIARFLOW_REWARD} {CURRENCY}</b>",
             reply_markup=piarflow_kb(sponsors),
             parse_mode="HTML"
         )
         return
 
-    await message.answer(
+    await state.clear()
+    await callback.message.edit_text(
         "✅ <b>Подписка подтверждена!</b>\n\n"
         "Спасибо за подписку и использование бота <b>WxSub</b>! 🎉\n\n"
         "📜 <b>Рекомендуем ознакомиться с Политикой конфиденциальности:</b>\n\n"
         "👉 Нажми на <b>бота</b> → <b>три точки</b> → <b>«Политика конфиденциальности»</b>.\n\n"
         "Либо отправь /privacy\n\n"
         "Приятного пользования! 💚",
-        reply_markup=main_menu_kb(uid),
         parse_mode="HTML"
     )
+    await callback.message.answer("🏠 Главное меню:", reply_markup=main_menu_kb(uid))
 
 
-@dp.message(F.text == "📢 Подписаться на канал")
-async def sub_link_handler(message: Message):
-    await message.answer(
-        f"📢 Подпишись: {CHANNEL_URL}\n\nПосле подписки нажми «✅ Проверить подписку»"
-    )
-
-
-# ================== ✅ Проверка PiarFlow (inline callback) ==================
+# ================== ✅ Проверка PiarFlow (обязательные при старте) ==================
 @dp.callback_query(F.data == "piarflow_check")
 async def piarflow_check_cb(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
@@ -457,23 +485,30 @@ async def piarflow_check_cb(callback: CallbackQuery, state: FSMContext):
 
     sponsors = await piarflow_check_sponsors(user_id, links)
     not_subscribed = [s for s in sponsors if s.get("status") != "subscribed"]
+    subscribed = [s for s in sponsors if s.get("status") == "subscribed"]
+
+    # 🔥 начисляем награду за каждого выполненного
+    rewarded = 0
+    for s in subscribed:
+        if await give_piarflow_reward(user_id, s["link"]):
+            rewarded += 1
 
     if not not_subscribed:
         await state.clear()
-        await callback.message.edit_text(
-            "✅ <b>Все задания выполнены!</b>\n\n"
-            "Добро пожаловать в главное меню.",
-            reply_markup=None, parse_mode="HTML"
-        )
-        await callback.message.answer(
-            "🏠 Главное меню:",
-            reply_markup=main_menu_kb(user_id)
-        )
+        text = "✅ <b>Все задания выполнены!</b>\n\n"
+        if rewarded:
+            text += f"🎁 Начислено: <b>{rewarded * PIARFLOW_REWARD} {CURRENCY}</b>\n\n"
+        text += "Добро пожаловать в главное меню."
+        await callback.message.edit_text(text, parse_mode="HTML")
+        await callback.message.answer("🏠 Главное меню:", reply_markup=main_menu_kb(user_id))
     else:
         await state.update_data(piarflow_links=[s["link"] for s in not_subscribed])
+        text = "❌ <b>Не все задания выполнены</b>\n\n"
+        if rewarded:
+            text += f"🎁 Начислено за выполненных: <b>{rewarded * PIARFLOW_REWARD} {CURRENCY}</b>\n\n"
+        text += "Подпишись на оставшихся спонсоров и снова нажми «✅ Проверить»."
         await callback.message.edit_text(
-            "❌ <b>Не все задания выполнены</b>\n\n"
-            "Подпишись на оставшихся спонсоров и снова нажми «✅ Проверить».",
+            text,
             reply_markup=piarflow_kb(not_subscribed),
             parse_mode="HTML"
         )
@@ -495,6 +530,14 @@ async def cancel_handler(message: Message, state: FSMContext):
     await message.answer("❌ Отменено. Главное меню:", reply_markup=main_menu_kb(user_id))
 
 
+@dp.callback_query(F.data == "main_menu")
+async def main_menu_callback(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer("🏠 <b>Главное меню</b>",
+                                   reply_markup=main_menu_kb(callback.from_user.id), parse_mode="HTML")
+    await callback.answer()
+
+
 # ================== 📜 Политика ==================
 @dp.message(F.text == "📜 Политика")
 @dp.message(Command("privacy"))
@@ -509,21 +552,13 @@ async def privacy_handler(message: Message):
 
 # ================== 💰 Заработать ==================
 @dp.message(F.text == "💰 Заработать")
-async def earn_handler(message: Message):
+async def earn_handler(message: Message, state: FSMContext):
     user_id = message.from_user.id
 
+    # 🔥 PiarFlow-спонсоры как задания
     sponsors = await piarflow_get_sponsors(user_id, message.chat.id)
 
-    if sponsors:
-        text = (
-            "💰 <b>Заработать</b>\n\n"
-            "🔥 <b>Доступные задания:</b>\n"
-            "Подпишись на спонсоров и нажми «✅ Проверить».\n\n"
-            "💎 После проверки получишь WxSub."
-        )
-        await message.answer(text, reply_markup=piarflow_kb(sponsors), parse_mode="HTML")
-        return
-
+    # Внутренние задания (твои каналы)
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT c.* FROM channels c
@@ -533,27 +568,112 @@ async def earn_handler(message: Message):
             ORDER BY c.price DESC LIMIT 20
         """, user_id)
 
-    if not rows:
+    if not sponsors and not rows:
         await message.answer("💰 <b>Заработать</b>\n\nПока нет доступных заданий. Заходи позже!",
                              reply_markup=earn_kb(), parse_mode="HTML")
         return
 
-    text = "💰 <b>Доступные задания</b>\n\n💎 <b>Задания WxSub:</b>\n"
+    text = "💰 <b>Доступные задания</b>\n\n"
+
+    # PiarFlow-блок
+    if sponsors:
+        text += "🔥 <b>Спонсоры PiarFlow:</b>\n"
+        text += f"За каждого спонсора +<b>{PIARFLOW_REWARD} {CURRENCY}</b>\n"
+        for i, s in enumerate(sponsors, 1):
+            text += f"• Спонсор {i}\n"
+        text += "\n👉 Подпишись и нажми «✅ Проверить»\n\n"
+
+    # Внутренние задания
+    if rows:
+        text += "💎 <b>Задания WxSub:</b>\n"
+        for r in rows:
+            left = "∞" if r["limit_total"] == 0 else str(r["limit_total"] - r["done_count"])
+            text += f"• <b>{r['title']}</b> — {r['price']} {CURRENCY} (осталось: {left})\n"
+
+    # Кнопки
     kb_rows = []
+    if sponsors:
+        for i, s in enumerate(sponsors, 1):
+            kb_rows.append([InlineKeyboardButton(
+                text=f"📢 Спонсор {i} · +{PIARFLOW_REWARD} {CURRENCY}",
+                url=s["link"]
+            )])
+        kb_rows.append([InlineKeyboardButton(text="✅ Проверить спонсоров", callback_data="earn_piarflow_check")])
+
     for r in rows:
-        left = "∞" if r["limit_total"] == 0 else str(r["limit_total"] - r["done_count"])
-        text += f"• <b>{r['title']}</b> — {r['price']} {CURRENCY} (осталось: {left})\n"
         kb_rows.append([
             InlineKeyboardButton(text=f"{r['title']} | {r['price']} {CURRENCY}", url=r["link"]),
             InlineKeyboardButton(text="✅ Проверить", callback_data=f"check_task_{r['id']}")
         ])
 
-    text += "\n👉 Нажми на кнопку, чтобы подписаться, затем «✅ Проверить»."
+    kb_rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="main_menu")])
+
     await message.answer(text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
         parse_mode="HTML", disable_web_page_preview=True)
 
 
+# ================== ✅ Проверка PiarFlow в «Заработать» (с наградой) ==================
+@dp.callback_query(F.data == "earn_piarflow_check")
+async def earn_piarflow_check_cb(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+
+    # получаем заново актуальных спонсоров
+    sponsors = await piarflow_get_sponsors(user_id, callback.message.chat.id)
+    if not sponsors:
+        await callback.answer("Нет активных спонсоров", show_alert=True)
+        return
+
+    links = [s["link"] for s in sponsors]
+    result = await piarflow_check_sponsors(user_id, links)
+    subscribed = [s for s in result if s.get("status") == "subscribed"]
+    not_subscribed = [s for s in result if s.get("status") != "subscribed"]
+
+    # 🔥 Начисляем награду за каждого выполненного
+    rewarded = 0
+    total_reward = 0
+    for s in subscribed:
+        if await give_piarflow_reward(user_id, s["link"]):
+            rewarded += 1
+            total_reward += PIARFLOW_REWARD
+
+    if rewarded:
+        text = f"✅ <b>Задания выполнены!</b>\n\n"
+        text += f"🎁 Начислено: <b>{total_reward} {CURRENCY}</b>\n"
+        text += f"📊 Выполнено спонсоров: <b>{rewarded}</b>\n\n"
+    else:
+        text = "ℹ️ <b>Новых выполненных заданий нет</b>\n\n"
+
+    if not_subscribed:
+        text += "❌ Осталось подписаться:\n"
+        for i, s in enumerate(not_subscribed, 1):
+            text += f"• Спонсор {i}\n"
+        text += "\nПодпишись и снова нажми «✅ Проверить»."
+
+        kb_rows = []
+        for i, s in enumerate(not_subscribed, 1):
+            kb_rows.append([InlineKeyboardButton(
+                text=f"📢 Спонсор {i} · +{PIARFLOW_REWARD} {CURRENCY}",
+                url=s["link"]
+            )])
+        kb_rows.append([InlineKeyboardButton(text="✅ Проверить", callback_data="earn_piarflow_check")])
+        kb_rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="main_menu")])
+
+        await callback.message.answer(text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
+            parse_mode="HTML")
+    else:
+        text += "🏆 Все спонсоры выполнены!\n\nВозвращайся позже за новыми."
+        await callback.message.answer(text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ В меню", callback_data="main_menu")]
+            ]),
+            parse_mode="HTML")
+
+    await callback.answer()
+
+
+# ================== ✅ Проверка внутренних заданий ==================
 @dp.callback_query(F.data.startswith("check_task_"))
 async def check_task_cb(callback: CallbackQuery):
     ch_id = int(callback.data.split("_")[2])
@@ -1029,6 +1149,8 @@ async def adm_stats_handler(message: Message):
         tasks_paid = await conn.fetchval("SELECT COALESCE(SUM(price),0) FROM tasks WHERE status IN ('active','payout_done')") or 0
         total_promos = await conn.fetchval("SELECT COUNT(*) FROM promotions")
         promos_sum = await conn.fetchval("SELECT COALESCE(SUM(total),0) FROM promotions WHERE status != 'deleted'") or 0
+        piarflow_rewards = await conn.fetchval("SELECT COUNT(*) FROM piarflow_rewards")
+        piarflow_sum = await conn.fetchval("SELECT COALESCE(SUM(amount),0) FROM piarflow_rewards") or 0
 
     text = (
         "📊 <b>Статистика</b>\n\n"
@@ -1037,7 +1159,8 @@ async def adm_stats_handler(message: Message):
         f"🚫 Бан: <b>{banned}</b>\n\n"
         f"💰 Балансы: <b>{round(total_balance,2)} {CURRENCY}</b>\n"
         f"🔄 Заданий выдано: <b>{round(tasks_paid,2)} {CURRENCY}</b>\n"
-        f"🔄 Продвижений: <b>{round(promos_sum,2)} {CURRENCY}</b>\n\n"
+        f"🔄 Продвижений: <b>{round(promos_sum,2)} {CURRENCY}</b>\n"
+        f"🔥 PiarFlow наград: <b>{piarflow_rewards}</b> на <b>{round(piarflow_sum,2)} {CURRENCY}</b>\n\n"
         f"✅ Заданий всего: <b>{total_tasks}</b>\n"
         f"✅ Сегодня: <b>{tasks_today}</b>\n"
         f"📈 Продвижений: <b>{total_promos}</b>\n\n"
@@ -1220,6 +1343,7 @@ async def adm_info_id(message: Message, state: FSMContext):
     async with pool.acquire() as conn:
         tasks_cnt = await conn.fetchval("SELECT COUNT(*) FROM tasks WHERE user_id=$1", uid) or 0
         promos_cnt = await conn.fetchval("SELECT COUNT(*) FROM promotions WHERE user_id=$1", uid) or 0
+        pf_cnt = await conn.fetchval("SELECT COUNT(*) FROM piarflow_rewards WHERE user_id=$1", uid) or 0
     text = (
         f"👤 <b>Инфо</b>\n\n"
         f"🆔 <code>{uid}</code>\n"
@@ -1228,6 +1352,7 @@ async def adm_info_id(message: Message, state: FSMContext):
         f"📅 {user['start_date'].strftime('%d.%m.%Y %H:%M')}\n"
         f"✅ Заданий: {tasks_cnt}\n"
         f"📈 Продвижений: {promos_cnt}\n"
+        f"🔥 PiarFlow: {pf_cnt}\n"
         f"👥 Рефералов: {user['ref_count'] or 0}\n"
         f"🚫 Бан: {'ДА' if user['banned'] else 'нет'}"
     )
